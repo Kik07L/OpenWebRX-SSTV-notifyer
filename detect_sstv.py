@@ -76,12 +76,14 @@ async def handle_new_file(filename):
 
     channel = bot.get_channel(SSTV_CHANNEL_ID)
     file = discord.File(filepath, filename=filename)
-    message = await channel.send(content=f"ðŸ“¡ New SSTV received: `{filename}`", file=file)
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    freq = filename.split('-')[-1].split('.')[0]  # Extraction de la fréquence depuis le nom de fichier
+    message = await channel.send(content=f"📡 **New SSTV Signal**\n**File**: `{filename}`\n**Frequency**: {freq} kHz\n**Time**: {now}", file=file)
 
-    await message.add_reaction("âœ…")
-    await message.add_reaction("âŒ")
+    await message.add_reaction("✅")
+    await message.add_reaction("❌")
 
-    c.execute("INSERT INTO sstv_events (filename, timestamp, validated) VALUES (?, ?, NULL)", (filename, datetime.now().isoformat()))
+    c.execute("INSERT INTO sstv_events (filename, timestamp, validated) VALUES (?, ?, NULL)", (filename, now))
     conn.commit()
 
 
@@ -89,7 +91,7 @@ async def handle_new_file(filename):
 async def on_ready():
     logging.info(f"Logged in as {bot.user.name}")
     await bot.tree.sync()
-    await bot.change_presence(status=Status.online, activity=Activity(type=ActivityType.streaming, name="The Ai Oshino Websdr", url="https://twitch.tv/kik07L"))
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.streaming, name="The Ai Oshino Websdr", url="https://twitch.tv/kik07L"))
     monitor_folder.start()
     update_stats_message.start()
 
@@ -102,12 +104,12 @@ async def on_raw_reaction_add(payload):
     channel = bot.get_channel(payload.channel_id)
     message = await channel.fetch_message(payload.message_id)
 
-    if str(payload.emoji) == "âŒ":
+    if str(payload.emoji) == "❌":
         await message.delete()
         c.execute("UPDATE sstv_events SET validated = 0 WHERE filename = ?", (extract_filename(message),))
         conn.commit()
 
-    elif str(payload.emoji) == "âœ…":
+    elif str(payload.emoji) == "✅":
         await message.clear_reactions()
         c.execute("UPDATE sstv_events SET validated = 1 WHERE filename = ?", (extract_filename(message),))
         conn.commit()
@@ -119,7 +121,7 @@ def extract_filename(message):
     return ""
 
 
-@tasks.loop(seconds=5)
+@tasks.loop(seconds=1)
 async def monitor_folder():
     files = os.listdir(WATCHED_FOLDER)
     new_files = set(files) - seen_files
@@ -128,7 +130,7 @@ async def monitor_folder():
     seen_files.update(new_files)
 
 
-@tasks.loop(seconds=10)
+@tasks.loop(seconds=5)
 async def update_stats_message():
     global stats_message
 
@@ -158,19 +160,19 @@ async def update_stats_message():
     uptime_sys = format_uptime(time.time() - psutil.boot_time())
 
     content = (
-        f"\nðŸ“Š **SSTV Stats**\n"
-        f"ðŸ›°ï¸ SDR Ping: `{sdr_ping}`\n"
-        f"ðŸ“¡ Bot Ping: `{bot_latency} ms`\n"
-        f"ðŸ“… **Last SSTV**: `{last_sstv}`\n"
-        f"ðŸ”‹ Bot Uptime: `{uptime_bot}`\n"
-        f"ðŸ–¥ï¸ Server Uptime: `{uptime_sys}`\n\n"
-        f"ðŸ“… **Today**:\n"
-        f"â€¢ Total: {total_today}\n"
-        f"â€¢ âœ… Approved: {approved_today} ({round((approved_today/total_today)*100) if total_today else 0}%)\n"
-        f"â€¢ âŒ Rejected: {rejected_today} ({round((rejected_today/total_today)*100) if total_today else 0}%)\n\n"
-        f"ðŸ—ƒï¸ **All-Time**:\n"
-        f"â€¢ âœ… Approved: {total_approved}\n"
-        f"â€¢ âŒ Rejected: {total_rejected}"
+        f"\n📡 **SSTV Stats**\n"
+        f"📶 SDR Ping: `{sdr_ping}`\n"
+        f"🤖 Bot Ping: `{bot_latency} ms`\n"
+        f"📅 **Last SSTV**: `{last_sstv}`\n"
+        f"⏰ Bot Uptime: `{uptime_bot}`\n"
+        f"🖥️ Server Uptime: `{uptime_sys}`\n\n"
+        f"📅 **Today**:\n"
+        f"• Total: {total_today}\n"
+        f"• ✅ Approved: {approved_today} ({round((approved_today/total_today)*100) if total_today else 0}%)\n"
+        f"• ❌ Rejected: {rejected_today} ({round((rejected_today/total_today)*100) if total_today else 0}%)\n\n"
+        f"🏆 **All-Time**:\n"
+        f"• ✅ Approved: {total_approved}\n"
+        f"• ❌ Rejected: {total_rejected}"
     )
 
     channel = bot.get_channel(STATS_CHANNEL_ID)
@@ -189,9 +191,9 @@ async def update_stats_message():
 
 @bot.tree.command(name="refreshstats", description="Force update the stats message")
 async def refreshstats(interaction: discord.Interaction):
-    await interaction.response.send_message("â³ Refreshing stats...", ephemeral=True)
+    await interaction.response.send_message("🔄 Refreshing stats...", ephemeral=True)
     await update_stats_message()
-    await interaction.edit_original_response(content="âœ… Stats updated.")
+    await interaction.edit_original_response(content="✅ Stats updated.")
 
 
 async def error_notifier(error_text):
