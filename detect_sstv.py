@@ -13,7 +13,7 @@ from discord import app_commands, Status, Activity, ActivityType
 from datetime import datetime, date
 from dotenv import load_dotenv
 from collections import deque
-
+import json
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -21,6 +21,12 @@ WATCHED_FOLDER = os.getenv("WATCHED_FOLDER", "/tmp")
 SSTV_CHANNEL_ID = int(os.getenv("SSTV_CHANNEL_ID"))
 STATS_CHANNEL_ID = int(os.getenv("STATS_CHANNEL_ID"))
 SDR_PING_HOST = os.getenv("SDR_PING_HOST", "192.168.1.1")
+# Nom du fichier JSON où la date et l'heure sont stockées
+LAST_SENT_FILE = "last_sent.json"
+DECODED_FILE_PATH = "/tmp/decoded.txt"  # Le chemin vers le fichier contenant les messages FT8 décodés
+DECODED_CHANNEL_ID = 1360728278305996830  # ID du salon Discord pour l'envoi des messages FT8
+last_decoded_lines = []
+
 
 logging.basicConfig(level=logging.INFO)
 bot_start_time = time.time()
@@ -49,18 +55,19 @@ MENTION_USER_ID = 552917118186684436
 ping_cache = deque(maxlen=1)
 ping_last_time = 0
 
+WSPR_CHANNEL_ID = 1360722712292757736
+WSPR_FILE_PATH = "/tmp/ALL_WSPR.TXT"
+last_wspl_lines = []
 
 def format_uptime(seconds):
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     return f"{hours}h {minutes}m"
 
-
 def extract_filename(message):
     for attachment in message.attachments:
         return attachment.filename
     return ""
-
 
 def ping(host):
     try:
@@ -78,8 +85,63 @@ def ping(host):
             return False, "unreachable"
     except:
         return False, "error"
+last_decoded_lines = []  # Liste des dernières lignes envoyées, à garder pour ne pas envoyer les mêmes
 
+async def monitor_decoded_file():
+    global last_decoded_lines
+    try:
+        if not os.path.exists(DECODED_FILE_PATH):
+            return
 
+        with open(DECODED_FILE_PATH, "r") as f:
+            lines = f.readlines()
+
+        lines = [line.strip() for line in lines if line.strip()]
+        new_lines = [line for line in lines if line not in last_decoded_lines]
+        last_decoded_lines = lines[-100:]  # Garder les 100 dernières lignes
+
+        if not new_lines:
+            return  # Si aucune nouvelle ligne, ne rien faire
+
+        channel = bot.get_channel(DECODED_CHANNEL_ID)
+        if not channel:
+            return
+
+        for line in new_lines:
+            parts = line.split()
+            if len(parts) >= 7:  # Vérifier qu'il y a suffisamment d'éléments pour traiter la ligne
+                date_time_str = parts[0]  # La première valeur est un identifiant temporel
+                try:
+                    # Formater la date et l'heure en objet datetime pour comparaison
+                    message_datetime = datetime.strptime(date_time_str, "%d%m%y")
+                    
+                    # Vérifier si la date est plus ancienne que celle du dernier message envoyé
+                    if last_sent_datetime and message_datetime <= last_sent_datetime:
+                        continue  # Ignorer si la date est antérieure ou égale à la dernière envoyée
+
+                    # Mettre à jour la dernière date et heure envoyée
+                    last_sent_datetime = message_datetime
+                    save_last_sent_datetime(last_sent_datetime)  # Sauvegarder la nouvelle date
+
+                    # Traitement du message FT8
+                    callsign_from = parts[-3]  # Callsign de l'émetteur
+                    callsign_to = parts[-2]  # Callsign du récepteur
+                    mode = parts[-1]  # Mode (FT8 dans ce cas)
+
+                    message = (
+                        f"📡 Nouveau message FT8 reçu :\n"
+                        f"```{line}```\n"
+                        f"🔗 QRZ (Emetteur) : [**{callsign_from}**](https://www.qrz.com/db/{callsign_from})\n"
+                        f"🔗 QRZ (Récepteur) : [**{callsign_to}**](https://www.qrz.com/db/{callsign_to})"
+                    )
+                    await channel.send(message)  # Envoi du message formaté
+
+                except ValueError:
+                    logging.error(f"Erreur de format de date dans la ligne FT8: {line}")
+
+    except Exception as e:
+        logging.error(f"Erreur dans monitor_decoded_file: {e}")
+        
 async def handle_new_file(filename):
     filepath = os.path.join(WATCHED_FOLDER, filename)
 
@@ -121,7 +183,6 @@ async def handle_new_file(filename):
     except Exception as e:
         logging.error(f"Failed to handle file {filename}: {e}", exc_info=True)
 
-
 @bot.event
 async def on_ready():
     logging.info(f"Logged in as {bot.user.name}")
@@ -130,7 +191,7 @@ async def on_ready():
     monitor_folder.start()
     update_stats_message.start()
     ping_watcher.start()
-
+    monitor_wspr_file.start()
 
 @bot.event
 async def on_raw_reaction_add(payload):
@@ -150,7 +211,6 @@ async def on_raw_reaction_add(payload):
         c.execute("UPDATE sstv_events SET validated = 1 WHERE filename = ?", (extract_filename(message),))
         conn.commit()
 
-
 @tasks.loop(seconds=3)
 async def monitor_folder():
     files = os.listdir(WATCHED_FOLDER)
@@ -159,7 +219,6 @@ async def monitor_folder():
         await handle_new_file(f)
     seen_files.update(new_files)
 
-
 @tasks.loop(seconds=30)
 async def ping_watcher():
     global ping_cache, ping_last_time
@@ -167,7 +226,6 @@ async def ping_watcher():
     ping_cache.clear()
     ping_cache.append((ok, result))
     ping_last_time = time.time()
-
 
 @tasks.loop(seconds=15)
 async def update_stats_message():
@@ -226,13 +284,87 @@ async def update_stats_message():
     else:
         await stats_message.edit(content=content)
 
+def load_last_sent_datetime():
+    try:
+        with open(LAST_SENT_FILE, "r") as f:
+            data = json.load(f)
+            return datetime.strptime(data["last_sent"], "%Y-%m-%d %H:%M:%S") if "last_sent" in data else None
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+# Fonction pour sauvegarder la date et l'heure du dernier message envoyé
+def save_last_sent_datetime(last_sent_datetime):
+    try:
+        with open(LAST_SENT_FILE, "w") as f:
+            data = {
+                "last_sent": last_sent_datetime.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            json.dump(data, f)
+    except Exception as e:
+        logging.error(f"Erreur lors de la sauvegarde de la date de dernier envoi: {e}")
+
+# Variable globale pour la dernière date et heure envoyée
+last_sent_datetime = load_last_sent_datetime()
+
+@tasks.loop(seconds=10)
+async def monitor_wspr_file():
+    global last_wspl_lines, last_sent_datetime
+    try:
+        if not os.path.exists(WSPR_FILE_PATH):
+            return
+
+        with open(WSPR_FILE_PATH, "r") as f:
+            lines = f.readlines()
+
+        lines = [line.strip() for line in lines if line.strip()]
+        new_lines = [line for line in lines if line not in last_wspl_lines]
+        last_wspl_lines = lines[-100:]
+
+        if not new_lines:
+            return
+
+        channel = bot.get_channel(WSPR_CHANNEL_ID)
+        if not channel:
+            return
+
+        for line in new_lines:
+            parts = line.split()
+            if len(parts) >= 6:
+                # Extraire la date et l'heure de la ligne
+                date_time_str = parts[0] + " " + parts[1]  # format: "250411 1750"
+                try:
+                    # Convertir la date et l'heure en objet datetime pour comparaison
+                    message_datetime = datetime.strptime(date_time_str, "%d%m%y %H%M")
+                    
+                    # Vérifier si la date est plus ancienne que celle du dernier message envoyé
+                    if last_sent_datetime and message_datetime <= last_sent_datetime:
+                        continue  # Ignorer le message si sa date est antérieure ou égale
+
+                    # Mettre à jour la dernière date et heure envoyée
+                    last_sent_datetime = message_datetime
+                    save_last_sent_datetime(last_sent_datetime)  # Sauvegarder la nouvelle date
+
+                    # Traitement du message WSPR
+                    callsign = parts[5]  # Call sign dans la ligne
+                    qrz_link = f"https://www.qrz.com/db/{callsign}"  # Lien QRZ pour le call sign
+                    message = (
+                        f"📡 Nouveau message WSPR reçu :\n"
+                        f"```{line}```\n"
+                        f"🔗 QRZ : [**{callsign}**]({qrz_link})"  # Call sign cliquable
+                    )
+                    await channel.send(message)  # Envoi du message formaté
+                except ValueError:
+                    logging.error(f"Erreur de format de date dans la ligne WSPR: {line}")
+
+    except Exception as e:
+        logging.error(f"Erreur dans monitor_wspr_file: {e}")
+
 
 @bot.tree.command(name="refreshstats", description="Force update the stats message")
 async def refreshstats(interaction: discord.Interaction):
     await interaction.response.send_message("🔄 Refreshing stats...", ephemeral=True)
     await update_stats_message()
     await interaction.edit_original_response(content="✅ Stats updated.")
-
 
 async def error_notifier(error_text):
     try:
@@ -247,7 +379,6 @@ async def error_notifier(error_text):
             await channel.send(content=message, file=discord.File(filename))
     except Exception as e:
         logging.error("Failed to send error notification", exc_info=e)
-
 
 if __name__ == "__main__":
     try:
