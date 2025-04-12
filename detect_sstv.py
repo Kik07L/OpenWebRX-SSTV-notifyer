@@ -1,3 +1,5 @@
+# file: sstv_bot_optimized.py
+
 import os
 import time
 import asyncio
@@ -10,6 +12,7 @@ from discord.ext import tasks, commands
 from discord import app_commands, Status, Activity, ActivityType
 from datetime import datetime, date
 from dotenv import load_dotenv
+from collections import deque
 
 load_dotenv()
 
@@ -41,14 +44,22 @@ conn.commit()
 
 seen_files = set()
 stats_message = None
-
 MENTION_USER_ID = 552917118186684436
+
+ping_cache = deque(maxlen=1)
+ping_last_time = 0
 
 
 def format_uptime(seconds):
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     return f"{hours}h {minutes}m"
+
+
+def extract_filename(message):
+    for attachment in message.attachments:
+        return attachment.filename
+    return ""
 
 
 def ping(host):
@@ -71,20 +82,44 @@ def ping(host):
 
 async def handle_new_file(filename):
     filepath = os.path.join(WATCHED_FOLDER, filename)
-    if not filename.endswith(".png") or not filename.startswith("SSTV-"):
+
+    if not filename.lower().endswith(".png") or not filename.startswith("SSTV-"):
         return
 
-    channel = bot.get_channel(SSTV_CHANNEL_ID)
-    file = discord.File(filepath, filename=filename)
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    freq = filename.split('-')[-1].split('.')[0]  # Extraction de la fréquence depuis le nom de fichier
-    message = await channel.send(content=f"📡 **New SSTV Signal**\n**File**: `{filename}`\n**Frequency**: {freq} kHz\n**Time**: {now}", file=file)
+    if not os.path.exists(filepath):
+        return
 
-    await message.add_reaction("✅")
-    await message.add_reaction("❌")
+    await asyncio.sleep(1)
 
-    c.execute("INSERT INTO sstv_events (filename, timestamp, validated) VALUES (?, ?, NULL)", (filename, now))
-    conn.commit()
+    try:
+        parts = filename.split('-')
+        freq = parts[-1].split('.')[0] if len(parts) >= 2 else "Unknown"
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        channel = bot.get_channel(SSTV_CHANNEL_ID)
+        if channel is None:
+            return
+
+        content = (
+            f"\n📡 **New SSTV Signal**\n"
+            f"**File**: `{filename}`\n"
+            f"**Frequency**: {freq} kHz\n"
+            f"**Time**: {now}"
+        )
+
+        file = discord.File(filepath, filename=filename)
+        message = await channel.send(content=content, file=file)
+
+        await asyncio.sleep(0.5)
+        await message.add_reaction("✅")
+        await asyncio.sleep(0.5)
+        await message.add_reaction("❌")
+
+        c.execute("INSERT INTO sstv_events (filename, timestamp, validated) VALUES (?, ?, NULL)", (filename, now))
+        conn.commit()
+
+    except Exception as e:
+        logging.error(f"Failed to handle file {filename}: {e}", exc_info=True)
 
 
 @bot.event
@@ -94,6 +129,7 @@ async def on_ready():
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.streaming, name="The Ai Oshino Websdr", url="https://twitch.tv/kik07L"))
     monitor_folder.start()
     update_stats_message.start()
+    ping_watcher.start()
 
 
 @bot.event
@@ -115,13 +151,7 @@ async def on_raw_reaction_add(payload):
         conn.commit()
 
 
-def extract_filename(message):
-    for attachment in message.attachments:
-        return attachment.filename
-    return ""
-
-
-@tasks.loop(seconds=1)
+@tasks.loop(seconds=3)
 async def monitor_folder():
     files = os.listdir(WATCHED_FOLDER)
     new_files = set(files) - seen_files
@@ -130,7 +160,16 @@ async def monitor_folder():
     seen_files.update(new_files)
 
 
-@tasks.loop(seconds=5)
+@tasks.loop(seconds=30)
+async def ping_watcher():
+    global ping_cache, ping_last_time
+    ok, result = ping(SDR_PING_HOST)
+    ping_cache.clear()
+    ping_cache.append((ok, result))
+    ping_last_time = time.time()
+
+
+@tasks.loop(seconds=15)
 async def update_stats_message():
     global stats_message
 
@@ -153,7 +192,7 @@ async def update_stats_message():
     c.execute("SELECT MAX(timestamp) FROM sstv_events")
     last_sstv = c.fetchone()[0] or "Never"
 
-    sdr_ok, sdr_ping = ping(SDR_PING_HOST)
+    sdr_ok, sdr_ping = ping_cache[0] if ping_cache else (False, "pending")
     bot_latency = round(bot.latency * 1000)
 
     uptime_bot = format_uptime(time.time() - bot_start_time)
@@ -176,7 +215,6 @@ async def update_stats_message():
     )
 
     channel = bot.get_channel(STATS_CHANNEL_ID)
-
     if stats_message is None:
         messages = [msg async for msg in channel.history(limit=10)]
         for msg in messages:
