@@ -8,14 +8,16 @@ import sqlite3
 import subprocess
 import logging
 import psutil
+import shutil
 from discord.ext import tasks, commands
 from discord import app_commands, Status, Activity, ActivityType
 from datetime import datetime, date
 from dotenv import load_dotenv
 from collections import deque
+from discord.ext.commands import Context
 import json
 load_dotenv()
-
+USER_DATA_DIR = "user_data"
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 WATCHED_FOLDER = os.getenv("WATCHED_FOLDER", "/tmp")
 SSTV_CHANNEL_ID = int(os.getenv("SSTV_CHANNEL_ID"))
@@ -86,6 +88,180 @@ def ping(host):
     except:
         return False, "error"
 last_decoded_lines = []  # Liste des dernières lignes envoyées, à garder pour ne pas envoyer les mêmes
+
+os.makedirs(USER_DATA_DIR, exist_ok=True)
+
+@bot.tree.command(name="log", description="Crée une base de données privée pour vous en MP")
+async def log_command(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    user_dir = os.path.join(USER_DATA_DIR, user_id)
+    db_path = os.path.join(user_dir, "data.db")
+
+    if os.path.exists(user_dir):
+        await interaction.response.send_message("Vous avez déjà une base de données.", ephemeral=True)
+        return
+
+    os.makedirs(user_dir)
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE ft_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT,
+            date TEXT,
+            call TEXT,
+            reste TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE stations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            description TEXT,
+            image_path TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+    try:
+        await interaction.user.send("🎉 Votre base de données a été créée avec succès ! Vous pouvez maintenant utiliser `/ft`, `/sta`, `/infos`, `/infosear`, `/export`, `/deleteall` et `/del` ici.")
+        await interaction.response.send_message("📬 Je vous ai envoyé un MP !", ephemeral=True)
+    except:
+        await interaction.response.send_message("Je n'ai pas réussi à vous envoyer un MP. Activez vos messages privés.", ephemeral=True)
+
+@bot.tree.command(name="ft", description="Ajoute un message radio FT8 dans votre base privée")
+@app_commands.describe(type="Type de FT (8 ou 4)", date="Date", call="Callsign", reste="Autres infos")
+async def ft(interaction: discord.Interaction, type: str, date: str, call: str, reste: str):
+    if interaction.guild:
+        await interaction.response.send_message("Cette commande n'est disponible qu'en MP.", ephemeral=True)
+        return
+
+    user_dir = os.path.join(USER_DATA_DIR, str(interaction.user.id))
+    db_path = os.path.join(user_dir, "data.db")
+    if not os.path.exists(db_path):
+        await interaction.response.send_message("Vous devez d'abord utiliser la commande /log.", ephemeral=True)
+        return
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("INSERT INTO ft_messages (type, date, call, reste) VALUES (?, ?, ?, ?)", (type, date, call, reste))
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message("✅ Message FT enregistré.")
+
+@bot.tree.command(name="sta", description="Ajoute une station de nombres découverte")
+@app_commands.describe(description="Description de la station")
+async def sta(interaction: discord.Interaction, description: str):
+    if interaction.guild:
+        await interaction.response.send_message("Cette commande n'est disponible qu'en MP.", ephemeral=True)
+        return
+
+    image_path = None
+    if interaction.attachments:
+        att = interaction.attachments[0]
+        user_dir = os.path.join(USER_DATA_DIR, str(interaction.user.id))
+        os.makedirs(user_dir, exist_ok=True)
+        image_path = os.path.join(user_dir, att.filename)
+        await att.save(image_path)
+
+    db_path = os.path.join(USER_DATA_DIR, str(interaction.user.id), "data.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute("INSERT INTO stations (description, image_path) VALUES (?, ?)", (description, image_path))
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message("📡 Station enregistrée.")
+
+@bot.tree.command(name="infos", description="Affiche tout ce qui est enregistré dans votre base")
+async def infos(interaction: discord.Interaction):
+    if interaction.guild:
+        await interaction.response.send_message("Cette commande n'est disponible qu'en MP.", ephemeral=True)
+        return
+
+    db_path = os.path.join(USER_DATA_DIR, str(interaction.user.id), "data.db")
+    if not os.path.exists(db_path):
+        await interaction.response.send_message("Aucune base trouvée. Utilisez d'abord /log", ephemeral=True)
+        return
+
+    conn = sqlite3.connect(db_path)
+    ft_rows = conn.execute("SELECT * FROM ft_messages").fetchall()
+    stations = conn.execute("SELECT * FROM stations").fetchall()
+    conn.close()
+
+    msg = f"**FT Messages:**\n"
+    for r in ft_rows:
+        msg += f"{r[0]}. {r[1]} | {r[2]} | {r[3]} | {r[4]}\n"
+    msg += "\n**Stations:**\n"
+    for s in stations:
+        msg += f"{s[0]}. {s[1]}\n"
+    await interaction.response.send_message(msg or "Rien enregistré.")
+
+@bot.tree.command(name="infosear", description="Recherche dans votre base")
+@app_commands.describe(query="Mot à rechercher")
+async def infosear(interaction: discord.Interaction, query: str):
+    if interaction.guild:
+        await interaction.response.send_message("Cette commande n'est disponible qu'en MP.", ephemeral=True)
+        return
+
+    db_path = os.path.join(USER_DATA_DIR, str(interaction.user.id), "data.db")
+    conn = sqlite3.connect(db_path)
+    ft_rows = conn.execute("SELECT * FROM ft_messages WHERE type LIKE ? OR call LIKE ? OR reste LIKE ?", (f"%{query}%",)*3).fetchall()
+    stations = conn.execute("SELECT * FROM stations WHERE description LIKE ?", (f"%{query}%",)).fetchall()
+    conn.close()
+
+    msg = f"**FT (resultats):**\n"
+    for r in ft_rows:
+        msg += f"{r[0]}. {r[1]} | {r[2]} | {r[3]} | {r[4]}\n"
+    msg += "\n**Stations (resultats):**\n"
+    for s in stations:
+        msg += f"{s[0]}. {s[1]}\n"
+    await interaction.response.send_message(msg or "Aucun résultat.")
+
+@bot.tree.command(name="export", description="Exportez votre base de données et images dans un fichier zip")
+async def export(interaction: discord.Interaction):
+    if interaction.guild:
+        await interaction.response.send_message("Commande disponible uniquement en MP.", ephemeral=True)
+        return
+
+    user_dir = os.path.join(USER_DATA_DIR, str(interaction.user.id))
+    if not os.path.exists(user_dir):
+        await interaction.response.send_message("Aucune base trouvée. Utilisez d'abord /log.", ephemeral=True)
+        return
+
+    zip_path = os.path.join(USER_DATA_DIR, f"export_{interaction.user.id}.zip")
+    shutil.make_archive(zip_path.replace(".zip", ""), 'zip', user_dir)
+    await interaction.response.send_message("Voici votre export :", file=discord.File(zip_path))
+    os.remove(zip_path)
+
+@bot.tree.command(name="deleteall", description="Supprime toute votre base de données et fichiers")
+async def deleteall(interaction: discord.Interaction):
+    user_dir = os.path.join(USER_DATA_DIR, str(interaction.user.id))
+    if os.path.exists(user_dir):
+        shutil.rmtree(user_dir)
+        await interaction.response.send_message("🗑️ Tous vos données ont été supprimées.")
+    else:
+        await interaction.response.send_message("Aucune base trouvée.")
+
+@bot.tree.command(name="del", description="Supprimer une entrée précise par ID et catégorie")
+@app_commands.describe(categorie="ft ou sta", id="Numéro de l'entrée à supprimer")
+async def delete(interaction: discord.Interaction, categorie: str, id: int):
+    if interaction.guild:
+        await interaction.response.send_message("Commande disponible uniquement en MP.", ephemeral=True)
+        return
+
+    table = "ft_messages" if categorie == "ft" else "stations" if categorie == "sta" else None
+    if not table:
+        await interaction.response.send_message("Catégorie invalide. Utilisez ft ou sta.", ephemeral=True)
+        return
+
+    db_path = os.path.join(USER_DATA_DIR, str(interaction.user.id), "data.db")
+    if not os.path.exists(db_path):
+        await interaction.response.send_message("Aucune base trouvée. Utilisez /log.", ephemeral=True)
+        return
+
+    conn = sqlite3.connect(db_path)
+    conn.execute(f"DELETE FROM {table} WHERE id = ?", (id,))
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message(f"Entrée {id} supprimée de {categorie}.")
 
 async def monitor_decoded_file():
     global last_decoded_lines
